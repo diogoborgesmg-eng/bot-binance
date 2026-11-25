@@ -8,18 +8,18 @@ from datetime import datetime, time as dtime
 
 API_KEY    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-PAR = os.environ.get("TRADING_PAR", "USDTBRL")
+PAR = os.environ.get("TRADING_PAR", "BTCUSDT")
 VALOR_OPERACAO_USDT = float(os.environ.get("VALOR_OPERACAO", "10"))
 STOP_LOSS_PCT       = 0.0025
 TRAILING_INICIO_PCT = 0.002
 TRAILING_DIST_PCT   = 0.0015
 PERDA_MAX_DIA_USDT  = float(os.environ.get("PERDA_MAX_DIA", "18"))
 META_DIA_USDT       = float(os.environ.get("META_DIA", "55"))
-HORARIO_INICIO = dtime(9, 0)
-HORARIO_FIM    = dtime(23, 0)
+HORARIO_INICIO = dtime(0, 0)
+HORARIO_FIM    = dtime(23, 59)
 RSI_PERIODO    = 14
-RSI_COMPRA_MAX = 55
-RSI_VENDA_MIN  = 45
+RSI_COMPRA_MAX = 65
+RSI_VENDA_MIN  = 35
 BB_PERIODO     = 20
 BB_DESVIO      = 2.0
 MA_RAPIDA      = 9
@@ -81,9 +81,9 @@ def verificar_sinal(df):
         if math.isnan(c[col]): return None
     cruzou_cima  = (c1["ma9"] <= c1["ma21"]) and (c["ma9"] > c["ma21"])
     cruzou_baixo = (c1["ma9"] >= c1["ma21"]) and (c["ma9"] < c["ma21"])
-    vol_ok     = 0.0003 <= c["range"] <= 0.005
-    if cruzou_cima and c["rsi"] < RSI_COMPRA_MAX and c["close"] <= c["bb_mid"] and vol_ok: return "compra"
-    if cruzou_baixo and c["rsi"] > RSI_VENDA_MIN and c["close"] >= c["bb_mid"] and vol_ok: return "venda"
+    vol_ok = 0.0001 <= c["range"] <= 0.02
+    if cruzou_cima and c["rsi"] < RSI_COMPRA_MAX and vol_ok: return "compra"
+    if cruzou_baixo and c["rsi"] > RSI_VENDA_MIN and vol_ok: return "venda"
     return None
 
 def abrir_ordem(cliente, sinal, preco):
@@ -97,7 +97,7 @@ def abrir_ordem(cliente, sinal, preco):
             ordem = cliente.order_market_sell(symbol=PAR, quantity=quantidade)
             sl = preco * (1 + STOP_LOSS_PCT)
         posicao_aberta = {"tipo": sinal, "entrada": preco, "sl": sl, "pico": preco, "quantidade": quantidade, "ordem_id": ordem["orderId"]}
-        log.info(f"✅ {sinal.upper()} | Preço: {preco:.6f} | Qtd: {quantidade} | SL: {sl:.6f}")
+        log.info(f"✅ {sinal.upper()} | Preço: {preco:.2f} | Qtd: {quantidade} | SL: {sl:.2f}")
     except Exception as e:
         log.error(f"❌ Erro ao abrir ordem: {e}")
 
@@ -155,10 +155,6 @@ def loop_bot():
                 status_bot = "stop_diario"
                 time.sleep(300)
                 continue
-            if not (HORARIO_INICIO <= agora.time() <= HORARIO_FIM):
-                status_bot = "fora_horario"
-                time.sleep(60)
-                continue
             status_bot = "rodando"
             df = obter_candles(cliente, 50)
             if df is None:
@@ -171,7 +167,7 @@ def loop_bot():
             else:
                 sinal = verificar_sinal(df)
                 if sinal:
-                    log.info(f"📡 Sinal: {sinal.upper()} | Preço: {preco_atual:.6f}")
+                    log.info(f"📡 Sinal: {sinal.upper()} | RSI: {df.iloc[-2]['rsi']:.1f} | Preço: {preco_atual:.2f}")
                     abrir_ordem(cliente, sinal, preco_atual)
             time.sleep(30)
         except Exception as e:
