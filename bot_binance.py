@@ -1,5 +1,5 @@
 """
-BOT BINANCE v3.1 — ETHUSDT
+BOT BINANCE v3.2 — ETHUSDT
 Fly.io — Sao Paulo
 """
 
