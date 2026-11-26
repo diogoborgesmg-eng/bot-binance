@@ -1,5 +1,5 @@
 """
-BOT BINANCE v3 — BTCUSDT
+BOT BINANCE v3 — ETHUSDT
 Fly.io — Sao Paulo
 """
 
@@ -8,8 +8,8 @@ from datetime import datetime, time as dtime
 
 API_KEY    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-PAR = os.environ.get("TRADING_PAR", "BTCUSDT")
-VALOR_OPERACAO_USDT = float(os.environ.get("VALOR_OPERACAO", "10"))
+PAR = os.environ.get("TRADING_PAR", "ETHUSDT")
+VALOR_OPERACAO_USDT = float(os.environ.get("VALOR_OPERACAO", "15"))
 STOP_LOSS_PCT = 0.0025
 TRAILING_INICIO_PCT = 0.002
 TRAILING_DIST_PCT = 0.0015
@@ -84,7 +84,6 @@ def calcular_indicadores(df):
     df["bb_std"] = df["close"].rolling(BB_PERIODO).std()
     df["bb_upper"] = df["bb_mid"] + BB_DESVIO * df["bb_std"]
     df["bb_lower"] = df["bb_mid"] - BB_DESVIO * df["bb_std"]
-    df["range"] = (df["high"] - df["low"]) / df["close"]
     return df
 
 def verificar_sinal(df):
@@ -98,17 +97,16 @@ def verificar_sinal(df):
             return None
     cruzou_cima = (c1["ma9"] <= c1["ma21"]) and (c["ma9"] > c["ma21"])
     cruzou_baixo = (c1["ma9"] >= c1["ma21"]) and (c["ma9"] < c["ma21"])
-    vol_ok = 0.0003 <= c["range"] <= 0.005
-    if cruzou_cima and c["rsi"] < RSI_COMPRA_MAX and c["close"] <= c["bb_mid"] and vol_ok:
+    if cruzou_cima and c["rsi"] < RSI_COMPRA_MAX and c["close"] <= c["bb_mid"]:
         return "compra"
-    if cruzou_baixo and c["rsi"] > RSI_VENDA_MIN and c["close"] >= c["bb_mid"] and vol_ok:
+    if cruzou_baixo and c["rsi"] > RSI_VENDA_MIN and c["close"] >= c["bb_mid"]:
         return "venda"
     return None
 
 def abrir_ordem(cliente, sinal, preco):
     global posicao_aberta
     try:
-        quantidade = round(VALOR_OPERACAO_USDT / preco, 6)
+        quantidade = round(VALOR_OPERACAO_USDT / preco, 4)
         if sinal == "compra":
             ordem = cliente.order_market_buy(symbol=PAR, quantity=quantidade)
             sl = preco * (1 - STOP_LOSS_PCT)
