@@ -1,5 +1,5 @@
 """
-BOT BINANCE v3.2 — DOGEUSDT
+BOT BINANCE v3.3 — DOGEUSDT
 Fly.io — Sao Paulo
 """
 
