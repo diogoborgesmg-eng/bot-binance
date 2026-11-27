@@ -1,5 +1,5 @@
 """
-BOT BINANCE v3.2 — ETHUSDT
+BOT BINANCE v3.2 — DOGEUSDT
 Fly.io — Sao Paulo
 """
 
@@ -8,8 +8,8 @@ from datetime import datetime, time as dtime
 
 API_KEY    = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-PAR = os.environ.get("TRADING_PAR", "ETHUSDT")
-VALOR_OPERACAO_USDT = float(os.environ.get("VALOR_OPERACAO", "15"))
+PAR = os.environ.get("TRADING_PAR", "DOGEUSDT")
+VALOR_OPERACAO_USDT = float(os.environ.get("VALOR_OPERACAO", "20"))
 STOP_LOSS_PCT = 0.0025
 TRAILING_INICIO_PCT = 0.002
 TRAILING_DIST_PCT = 0.0015
@@ -103,10 +103,32 @@ def verificar_sinal(df):
         return "venda"
     return None
 
+def obter_step_size(cliente, symbol):
+    try:
+        info = cliente.get_symbol_info(symbol)
+        for f in info["filters"]:
+            if f["filterType"] == "LOT_SIZE":
+                step = float(f["stepSize"])
+                return step
+    except:
+        pass
+    return 1.0
+
+def arredondar_quantidade(quantidade, step_size):
+    import math
+    casas = int(round(-math.log10(step_size)))
+    return round(math.floor(quantidade / step_size) * step_size, casas)
+
 def abrir_ordem(cliente, sinal, preco):
     global posicao_aberta
     try:
-        quantidade = round(VALOR_OPERACAO_USDT / preco, 4)
+        step_size = obter_step_size(cliente, PAR)
+        quantidade_raw = VALOR_OPERACAO_USDT / preco
+        quantidade = arredondar_quantidade(quantidade_raw, step_size)
+        log.info(f"Calculando: {VALOR_OPERACAO_USDT}/{preco:.6f} = {quantidade_raw:.4f} -> step={step_size} -> qtd={quantidade}")
+        if quantidade <= 0:
+            log.error(f"Quantidade zerada! step={step_size}")
+            return False
         if sinal == "compra":
             ordem = cliente.order_market_buy(symbol=PAR, quantity=quantidade)
             sl = preco * (1 - STOP_LOSS_PCT)
@@ -114,7 +136,7 @@ def abrir_ordem(cliente, sinal, preco):
             ordem = cliente.order_market_sell(symbol=PAR, quantity=quantidade)
             sl = preco * (1 + STOP_LOSS_PCT)
         posicao_aberta = {"tipo": sinal, "entrada": preco, "sl": sl, "pico": preco, "quantidade": quantidade, "ordem_id": ordem["orderId"]}
-        log.info(f"ORDEM {sinal.upper()} | Preco: {preco:.2f} | Qtd: {quantidade} | SL: {sl:.2f}")
+        log.info(f"ORDEM {sinal.upper()} | Preco: {preco:.6f} | Qtd: {quantidade} | SL: {sl:.6f}")
         return True
     except Exception as e:
         log.error(f"Erro ordem: {e}")
@@ -158,7 +180,7 @@ def dentro_do_horario():
 
 def loop_bot():
     global resultado_dia, posicao_aberta, status_bot
-    log.info("BOT BINANCE v3 INICIADO | Par: " + PAR)
+    log.info("BOT BINANCE v3.2 INICIADO | Par: " + PAR)
     cliente = None
     ultimo_dia = datetime.now().date()
     while True:
@@ -196,7 +218,7 @@ def loop_bot():
             else:
                 sinal = verificar_sinal(df)
                 if sinal:
-                    log.info(f"Sinal: {sinal.upper()} | RSI: {df.iloc[-2]['rsi']:.1f} | Preco: {preco_atual:.2f}")
+                    log.info(f"Sinal: {sinal.upper()} | RSI: {df.iloc[-2]['rsi']:.1f} | Preco: {preco_atual:.6f}")
                     abrir_ordem(cliente, sinal, preco_atual)
             time.sleep(30)
         except Exception as e:
@@ -208,7 +230,7 @@ def iniciar_servidor_web():
     from http.server import HTTPServer, BaseHTTPRequestHandler
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            html = f"v3|{status_bot}|{PAR}|dia:${resultado_dia:.4f}|pos:{'aberta' if posicao_aberta else 'nenhuma'}|IP:{ip_publico}|{datetime.now().strftime('%H:%M:%S')}"
+            html = f"v3.2|{status_bot}|{PAR}|dia:${resultado_dia:.4f}|pos:{'aberta' if posicao_aberta else 'nenhuma'}|IP:{ip_publico}|{datetime.now().strftime('%H:%M:%S')}"
             msg = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
