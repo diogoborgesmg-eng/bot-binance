@@ -1,7 +1,13 @@
 """
-BOT BINANCE v4.0 — DOGEUSDT
+BOT BINANCE v4.1 — DOGEUSDC
 Fly.io — Sao Paulo
-Estrategia: MA9xMA21 + RSI + Bollinger Bands + Trailing Stop
+Estrategia: MA9xMA21 + RSI + Trailing Stop
+Changelog v4.1:
+  - RSI faixa ampliada (68/32 em vez de 65/35)
+  - Bollinger Bands removido como filtro obrigatorio
+  - Corrigida logica de venda sem posicao aberta
+  - TIMEFRAME configuravel via variavel de ambiente
+  - Logs detalhados mostrando motivo de nao gerar sinal
 """
 
 import os, time, math, logging, threading, urllib.request
@@ -9,62 +15,35 @@ from datetime import datetime, time as dtime
 
 API_KEY             = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET          = os.environ.get("BINANCE_API_SECRET", "")
-PAR                 = os.environ.get("TRADING_PAR", "DOGEUSDT")
+PAR                 = os.environ.get("TRADING_PAR", "DOGEUSDC")
 VALOR_OPERACAO_USDT = float(os.environ.get("VALOR_OPERACAO", "20"))
 STOP_LOSS_PCT       = 0.0025
 TRAILING_INICIO_PCT = 0.002
 TRAILING_DIST_PCT   = 0.0015
 PERDA_MAX_DIA_USDT  = float(os.environ.get("PERDA_MAX_DIA", "18"))
-META_DIA_USDT       = float(os.environ.get("META_DIA", "55"))
+META_DIA_USDT       = float(os.environ.get("META_DIA", "999"))
 RSI_PERIODO         = 14
-RSI_COMPRA_MAX      = 65
-RSI_VENDA_MIN       = 35
-BB_PERIODO          = 20
-BB_DESVIO           = 2.0
+RSI_COMPRA_MAX      = 68   # era 65
+RSI_VENDA_MIN       = 32   # era 35
 MA_RAPIDA           = 9
 MA_LENTA            = 21
-TIMEFRAME           = "1m"
+TIMEFRAME           = os.environ.get("TIMEFRAME", "1m")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler()]
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
-log = logging.getLogger("BotBinance")
+log = logging.getLogger(__name__)
 
-resultado_dia  = 0.0
-posicao_aberta = None
-status_bot     = "iniciando"
-ip_publico     = "descobrindo..."
-total_ordens   = 0
-total_ganhos   = 0
-total_perdas   = 0
 step_size_cache = {}
-
-def descobrir_ip():
-    global ip_publico
-    for url in ["https://api.ipify.org", "https://ifconfig.me/ip"]:
-        try:
-            with urllib.request.urlopen(url, timeout=5) as r:
-                ip = r.read().decode().strip()
-                ip_publico = ip
-                log.info(f"IP publico: {ip}")
-                return ip
-        except:
-            continue
-    ip_publico = "desconhecido"
-    return "desconhecido"
-
-def criar_cliente():
-    try:
-        from binance.client import Client
-        cliente = Client(API_KEY, API_SECRET)
-        info = cliente.get_account()
-        log.info(f"Binance conectada | Conta: {info['accountType']}")
-        return cliente
-    except Exception as e:
-        log.error(f"Erro ao conectar Binance: {e}")
-        return None
+posicao_aberta  = False
+preco_entrada   = 0.0
+max_preco       = 0.0
+trailing_ativo  = False
+lucro_dia       = 0.0
+perda_dia       = 0.0
+total_ordens    = 0
 
 def obter_step_size(cliente, symbol):
     if symbol in step_size_cache:
@@ -86,219 +65,261 @@ def arredondar_quantidade(quantidade, step_size):
     qtd = math.floor(quantidade / step_size) * step_size
     return round(qtd, casas)
 
-def obter_candles(cliente, n=50):
-    import pandas as pd
+def calcular_rsi(precos, periodo=14):
+    if len(precos) < periodo + 1:
+        return 50
+    deltas = [precos[i] - precos[i-1] for i in range(1, len(precos))]
+    ganhos = [d if d > 0 else 0 for d in deltas]
+    perdas = [-d if d < 0 else 0 for d in deltas]
+    media_ganho = sum(ganhos[-periodo:]) / periodo
+    media_perda = sum(perdas[-periodo:]) / periodo
+    if media_perda == 0:
+        return 100
+    rs = media_ganho / media_perda
+    return 100 - (100 / (1 + rs))
+
+def calcular_ma(precos, periodo):
+    if len(precos) < periodo:
+        return None
+    return sum(precos[-periodo:]) / periodo
+
+def obter_saldo_base(cliente):
+    """Retorna saldo disponivel da moeda cotacao (USDC ou USDT)"""
     try:
-        klines = cliente.get_klines(symbol=PAR, interval=TIMEFRAME, limit=n)
-        df = pd.DataFrame(klines, columns=[
-            "time","open","high","low","close","volume",
-            "close_time","quote_vol","trades","taker_buy_base",
-            "taker_buy_quote","ignore"
-        ])
-        for col in ["open","high","low","close"]:
-            df[col] = df[col].astype(float)
-        df["time"] = pd.to_datetime(df["time"], unit="ms")
-        return df
+        moeda_cotacao = PAR.replace("DOGE", "").replace("BTC", "").replace("ETH", "").replace("BNB", "")
+        conta = cliente.get_account()
+        for ativo in conta["balances"]:
+            if ativo["asset"] == moeda_cotacao:
+                return float(ativo["free"])
     except Exception as e:
-        log.error(f"Erro ao obter candles: {e}")
-        return None
+        log.error(f"Erro ao obter saldo: {e}")
+    return 0.0
 
-def calcular_indicadores(df):
-    df = df.copy()
-    df["ma9"]     = df["close"].rolling(MA_RAPIDA).mean()
-    df["ma21"]    = df["close"].rolling(MA_LENTA).mean()
-    delta = df["close"].diff()
-    mg = delta.where(delta > 0, 0.0).rolling(RSI_PERIODO).mean()
-    mp = (-delta.where(delta < 0, 0.0)).rolling(RSI_PERIODO).mean()
-    df["rsi"]     = 100 - (100 / (1 + (mg / mp)))
-    df["bb_mid"]  = df["close"].rolling(BB_PERIODO).mean()
-    df["bb_std"]  = df["close"].rolling(BB_PERIODO).std()
-    df["bb_upper"]= df["bb_mid"] + BB_DESVIO * df["bb_std"]
-    df["bb_lower"]= df["bb_mid"] - BB_DESVIO * df["bb_std"]
-    return df
-
-def verificar_sinal(df):
-    if len(df) < 25:
-        return None
-    c  = df.iloc[-2]
-    c1 = df.iloc[-3]
-    for col in ["ma9","ma21","rsi","bb_mid"]:
-        if math.isnan(c[col]):
-            return None
-    cruzou_cima  = (c1["ma9"] <= c1["ma21"]) and (c["ma9"] > c["ma21"])
-    cruzou_baixo = (c1["ma9"] >= c1["ma21"]) and (c["ma9"] < c["ma21"])
-    if cruzou_cima and c["rsi"] < RSI_COMPRA_MAX and c["close"] <= c["bb_mid"]:
-        return "compra"
-    if cruzou_baixo and c["rsi"] > RSI_VENDA_MIN and c["close"] >= c["bb_mid"]:
-        return "venda"
-    return None
+def obter_saldo_doge(cliente):
+    """Retorna saldo disponivel de DOGE"""
+    try:
+        moeda_base = "DOGE"
+        conta = cliente.get_account()
+        for ativo in conta["balances"]:
+            if ativo["asset"] == moeda_base:
+                return float(ativo["free"])
+    except Exception as e:
+        log.error(f"Erro ao obter saldo DOGE: {e}")
+    return 0.0
 
 def abrir_ordem(cliente, sinal, preco):
     global posicao_aberta, total_ordens
     try:
         step = obter_step_size(cliente, PAR)
-        qtd_raw = VALOR_OPERACAO_USDT / preco
-        quantidade = arredondar_quantidade(qtd_raw, step)
-        log.info(f"Calculando ordem: ${VALOR_OPERACAO_USDT} / {preco} = {qtd_raw:.4f} | step={step} | qtd final={quantidade}")
-        if quantidade <= 0:
-            log.error(f"Quantidade invalida: {quantidade} | Verifique VALOR_OPERACAO e preco do par")
-            return False
+
         if sinal == "compra":
+            qtd_raw = VALOR_OPERACAO_USDT / preco
+            quantidade = arredondar_quantidade(qtd_raw, step)
+            log.info(f"Calculando ordem: ${VALOR_OPERACAO_USDT} / {preco} = {qtd_raw:.4f} | step={step} | qtd final={quantidade}")
+            if quantidade <= 0:
+                log.error(f"Quantidade invalida: {quantidade}")
+                return False
             ordem = cliente.order_market_buy(symbol=PAR, quantity=quantidade)
-            sl = preco * (1 - STOP_LOSS_PCT)
-        else:
+
+        elif sinal == "venda":
+            # Verifica se tem DOGE para vender
+            saldo_doge = obter_saldo_doge(cliente)
+            quantidade = arredondar_quantidade(saldo_doge, step)
+            log.info(f"Venda: saldo DOGE={saldo_doge:.2f} | qtd final={quantidade}")
+            if quantidade <= 0:
+                log.warning("Sem DOGE para vender — ignorando sinal de venda")
+                return False
             ordem = cliente.order_market_sell(symbol=PAR, quantity=quantidade)
-            sl = preco * (1 + STOP_LOSS_PCT)
-        posicao_aberta = {
-            "tipo": sinal, "entrada": preco, "sl": sl,
-            "pico": preco, "quantidade": quantidade,
-            "ordem_id": ordem["orderId"],
-            "hora": datetime.now().strftime("%H:%M:%S")
-        }
+
+        else:
+            return False
+
+        log.info(f"Ordem {sinal.upper()} executada | {PAR} | Qtd: {quantidade} | Preco: {preco}")
         total_ordens += 1
-        log.info(f"ORDEM ABERTA | {sinal.upper()} | Preco: {preco} | Qtd: {quantidade} | SL: {sl:.6f} | ID: {ordem['orderId']}")
+        posicao_aberta = (sinal == "compra")
         return True
+
     except Exception as e:
         log.error(f"Erro ao abrir ordem | Sinal: {sinal} | Preco: {preco} | Erro: {e}")
         return False
 
-def gerenciar_posicao(cliente, preco_atual):
-    global posicao_aberta, resultado_dia, total_ganhos, total_perdas
-    if posicao_aberta is None:
+def verificar_trailing_stop(cliente, preco_atual):
+    global posicao_aberta, preco_entrada, max_preco, trailing_ativo, perda_dia
+
+    if not posicao_aberta:
         return
-    p = posicao_aberta
-    fechar = False
-    if p["tipo"] == "compra":
-        lucro_pct = (preco_atual - p["entrada"]) / p["entrada"]
-        if preco_atual > p["pico"]: p["pico"] = preco_atual
-        if lucro_pct >= TRAILING_INICIO_PCT:
-            novo_sl = p["pico"] * (1 - TRAILING_DIST_PCT)
-            if novo_sl > p["sl"]: p["sl"] = novo_sl
-        if preco_atual <= p["sl"]: fechar = True
-    else:
-        lucro_pct = (p["entrada"] - preco_atual) / p["entrada"]
-        if preco_atual < p["pico"]: p["pico"] = preco_atual
-        if lucro_pct >= TRAILING_INICIO_PCT:
-            novo_sl = p["pico"] * (1 + TRAILING_DIST_PCT)
-            if novo_sl < p["sl"]: p["sl"] = novo_sl
-        if preco_atual >= p["sl"]: fechar = True
-    if fechar:
-        lucro_usdt = lucro_pct * VALOR_OPERACAO_USDT
-        resultado_dia += lucro_usdt
-        if lucro_usdt >= 0:
-            total_ganhos += 1
-            log.info(f"FECHOU LUCRO | {p['tipo'].upper()} | Lucro: ${lucro_usdt:.4f} | Dia: ${resultado_dia:.4f}")
-        else:
-            total_perdas += 1
-            log.info(f"FECHOU PERDA | {p['tipo'].upper()} | Perda: ${lucro_usdt:.4f} | Dia: ${resultado_dia:.4f}")
-        try:
-            if p["tipo"] == "compra":
-                cliente.order_market_sell(symbol=PAR, quantity=p["quantidade"])
-            else:
-                cliente.order_market_buy(symbol=PAR, quantity=p["quantidade"])
-        except Exception as e:
-            log.error(f"Erro ao fechar ordem: {e}")
-        posicao_aberta = None
 
-def relatorio_dia():
-    log.info("=" * 50)
-    log.info(f"RELATORIO DO DIA | Par: {PAR}")
-    log.info(f"Resultado: ${resultado_dia:.4f}")
-    log.info(f"Ordens: {total_ordens} | Ganhos: {total_ganhos} | Perdas: {total_perdas}")
-    log.info("=" * 50)
+    # Stop loss fixo
+    stop_fixo = preco_entrada * (1 - STOP_LOSS_PCT)
+    if preco_atual <= stop_fixo:
+        log.warning(f"STOP LOSS ativado | Entrada: {preco_entrada} | Atual: {preco_atual}")
+        if abrir_ordem(cliente, "venda", preco_atual):
+            perda = (preco_atual - preco_entrada) / preco_entrada * VALOR_OPERACAO_USDT
+            perda_dia += abs(perda)
+            posicao_aberta = False
+            trailing_ativo = False
+        return
 
-def loop_bot():
-    global resultado_dia, posicao_aberta, status_bot, total_ordens, total_ganhos, total_perdas
-    log.info("=" * 50)
-    log.info(f"BOT BINANCE v4.0 INICIADO | Par: {PAR}")
-    log.info(f"Valor por operacao: ${VALOR_OPERACAO_USDT}")
-    log.info(f"Stop dia: ${PERDA_MAX_DIA_USDT} | Meta dia: ${META_DIA_USDT}")
-    log.info("=" * 50)
-    cliente = None
+    # Trailing stop
+    if preco_atual > max_preco:
+        max_preco = preco_atual
+
+    ganho_pct = (max_preco - preco_entrada) / preco_entrada
+    if ganho_pct >= TRAILING_INICIO_PCT:
+        trailing_ativo = True
+
+    if trailing_ativo:
+        trailing_stop = max_preco * (1 - TRAILING_DIST_PCT)
+        if preco_atual <= trailing_stop:
+            log.info(f"TRAILING STOP ativado | Max: {max_preco} | Atual: {preco_atual}")
+            if abrir_ordem(cliente, "venda", preco_atual):
+                lucro = (preco_atual - preco_entrada) / preco_entrada * VALOR_OPERACAO_USDT
+                if lucro > 0:
+                    global lucro_dia
+                    lucro_dia += lucro
+                else:
+                    perda_dia += abs(lucro)
+                posicao_aberta = False
+                trailing_ativo = False
+
+def resetar_dia():
+    global lucro_dia, perda_dia, total_ordens
+    lucro_dia = 0.0
+    perda_dia = 0.0
+    total_ordens = 0
+    log.info("Novo dia — contadores resetados")
+
+def loop_principal(cliente):
+    global posicao_aberta, preco_entrada, max_preco, trailing_ativo
+
     ultimo_dia = datetime.now().date()
+    log.info(f"Loop iniciado | Par: {PAR} | Timeframe: {TIMEFRAME}")
+
     while True:
         try:
-            if cliente is None:
-                status_bot = "conectando"
-                cliente = criar_cliente()
-                if not cliente:
-                    status_bot = "erro_conexao"
-                    time.sleep(60)
-                    continue
-                status_bot = "rodando"
-                obter_step_size(cliente, PAR)
-
             agora = datetime.now()
+
+            # Reset diario
             if agora.date() != ultimo_dia:
-                relatorio_dia()
-                resultado_dia = 0.0
-                posicao_aberta = None
-                total_ordens = 0
-                total_ganhos = 0
-                total_perdas = 0
+                resetar_dia()
                 ultimo_dia = agora.date()
 
-            if resultado_dia <= -PERDA_MAX_DIA_USDT:
-                if status_bot != "stop_diario":
-                    log.warning(f"STOP DIARIO atingido | Perda: ${resultado_dia:.4f}")
-                status_bot = "stop_diario"
+            # Verificar limites do dia
+            if perda_dia >= PERDA_MAX_DIA_USDT:
+                log.warning(f"Stop diario atingido: perda=${perda_dia:.2f} | Aguardando proximo dia...")
                 time.sleep(300)
                 continue
 
-            status_bot = "rodando"
-            df = obter_candles(cliente, 50)
-            if df is None:
+            if lucro_dia >= META_DIA_USDT:
+                log.info(f"Meta diaria atingida: lucro=${lucro_dia:.2f} | Aguardando proximo dia...")
+                time.sleep(300)
+                continue
+
+            # Obter candles
+            klines = cliente.get_klines(symbol=PAR, interval=TIMEFRAME, limit=50)
+            fechamentos = [float(k[4]) for k in klines]
+            preco_atual = fechamentos[-1]
+
+            # Calcular indicadores
+            ma_rapida = calcular_ma(fechamentos, MA_RAPIDA)
+            ma_lenta  = calcular_ma(fechamentos, MA_LENTA)
+            rsi       = calcular_rsi(fechamentos, RSI_PERIODO)
+
+            if ma_rapida is None or ma_lenta is None:
                 time.sleep(10)
                 continue
 
-            df = calcular_indicadores(df)
-            preco_atual = float(df.iloc[-1]["close"])
-
+            # Verificar trailing stop se tem posicao
             if posicao_aberta:
-                gerenciar_posicao(cliente, preco_atual)
+                verificar_trailing_stop(cliente, preco_atual)
+
+            # Gerar sinal
+            sinal = None
+            motivo_bloqueio = []
+
+            if ma_rapida > ma_lenta:
+                # Condicao de compra: MA rapida acima da lenta
+                if rsi <= RSI_COMPRA_MAX:
+                    if not posicao_aberta:
+                        sinal = "compra"
+                    else:
+                        motivo_bloqueio.append("posicao ja aberta")
+                else:
+                    motivo_bloqueio.append(f"RSI alto demais para compra: {rsi:.1f} > {RSI_COMPRA_MAX}")
+            elif ma_rapida < ma_lenta:
+                # Condicao de venda: MA rapida abaixo da lenta
+                if rsi >= RSI_VENDA_MIN:
+                    if posicao_aberta:
+                        sinal = "venda"
+                    else:
+                        motivo_bloqueio.append("sem posicao aberta para vender")
+                else:
+                    motivo_bloqueio.append(f"RSI baixo demais para venda: {rsi:.1f} < {RSI_VENDA_MIN}")
+
+            if sinal:
+                log.info(f"SINAL: {sinal.upper()} | RSI: {rsi:.1f} | MA9: {ma_rapida:.6f} | MA21: {ma_lenta:.6f} | Preco: {preco_atual:.5f}")
+                if abrir_ordem(cliente, sinal, preco_atual):
+                    if sinal == "compra":
+                        preco_entrada = preco_atual
+                        max_preco = preco_atual
+                        trailing_ativo = False
             else:
-                sinal = verificar_sinal(df)
-                if sinal:
-                    c = df.iloc[-2]
-                    log.info(f"SINAL: {sinal.upper()} | RSI: {c['rsi']:.1f} | MA9: {c['ma9']:.6f} | MA21: {c['ma21']:.6f} | Preco: {preco_atual}")
-                    abrir_ordem(cliente, sinal, preco_atual)
+                # Log a cada 10 minutos para nao encher os logs
+                if agora.minute % 10 == 0 and agora.second < 30:
+                    status = "POSICAO ABERTA" if posicao_aberta else "aguardando sinal"
+                    bloqueio = " | ".join(motivo_bloqueio) if motivo_bloqueio else "sem cruzamento de MA"
+                    log.info(f"Status: {status} | RSI: {rsi:.1f} | MA9: {ma_rapida:.6f} | MA21: {ma_lenta:.6f} | Motivo: {bloqueio}")
 
             time.sleep(30)
 
         except Exception as e:
-            log.error(f"Erro no loop principal: {e}")
-            cliente = None
+            log.error(f"Erro no loop: {e}")
             time.sleep(30)
 
 def iniciar_servidor_web():
     from http.server import HTTPServer, BaseHTTPRequestHandler
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            pos_info = "nenhuma"
-            if posicao_aberta:
-                p = posicao_aberta
-                pos_info = f"{p['tipo']}@{p['entrada']}|sl:{p['sl']:.6f}|desde:{p['hora']}"
-            html = (
-                f"BOT BINANCE v4.0\n"
-                f"Status: {status_bot}\n"
-                f"Par: {PAR}\n"
-                f"Resultado dia: ${resultado_dia:.4f}\n"
-                f"Ordens: {total_ordens} | Ganhos: {total_ganhos} | Perdas: {total_perdas}\n"
-                f"Posicao: {pos_info}\n"
-                f"IP: {ip_publico}\n"
-                f"Hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
-            )
-            msg = html.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(msg)
-        def log_message(self, *args): pass
+            status = (
+                f"BOT BINANCE v4.1 | Par: {PAR} | "
+                f"Posicao: {'ABERTA' if posicao_aberta else 'fechada'} | "
+                f"Lucro dia: ${lucro_dia:.2f} | Perda dia: ${perda_dia:.2f} | "
+                f"Ordens: {total_ordens}"
+            )
+            self.wfile.write(status.encode())
+
+        def log_message(self, format, *args):
+            pass
+
     porta = int(os.environ.get("PORT", 8080))
     log.info(f"Servidor web porta {porta}")
     HTTPServer(("0.0.0.0", porta), Handler).serve_forever()
 
+def obter_ip_publico():
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as r:
+            ip = r.read().decode()
+            log.info(f"IP publico: {ip}")
+    except:
+        log.warning("Nao foi possivel obter IP publico")
+
 if __name__ == "__main__":
-    threading.Thread(target=descobrir_ip, daemon=True).start()
-    threading.Thread(target=loop_bot, daemon=True).start()
-    iniciar_servidor_web()
+    from binance.client import Client
+
+    log.info("=" * 50)
+    log.info(f"BOT BINANCE v4.1 INICIADO | Par: {PAR}")
+    log.info(f"Valor por operacao: ${VALOR_OPERACAO_USDT}")
+    log.info(f"Stop dia: ${PERDA_MAX_DIA_USDT} | Meta dia: ${META_DIA_USDT}")
+    log.info("=" * 50)
+
+    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
+    obter_ip_publico()
+
+    cliente = Client(API_KEY, API_SECRET)
+    info = cliente.get_account()
+    log.info(f"Binance conectada | Conta: {info['accountType']}")
+
+    loop_principal(cliente)
